@@ -1,0 +1,182 @@
+--- zones.js	2026-06-29 15:51:40.000000000 +0800
++++ zones1.js	2026-06-30 15:47:25.933207274 +0800
+@@ -5,6 +5,7 @@
+ 'require form';
+ 'require network';
+ 'require firewall';
++'require fs';
+ 'require tools.firewall as fwtool';
+ 'require tools.widgets as widgets';
+ 
+@@ -16,10 +17,46 @@
+ 	}),
+ 
+ 	load() {
+-		return Promise.all([
+-			this.callConntrackHelpers(),
+-			firewall.getDefaults()
+-		]);
++		var checkModule = function(path) {
++			return L.resolveDefault(fs.stat(path), null).then(function(stat) {
++				return stat !== null;
++			});
++		};
++
++		// 读取 /proc/version 获取内核版本
++		return L.resolveDefault(fs.read('/proc/version'), '').then(function(versionStr) {
++			var kernelVersion = '';
++			if (versionStr) {
++				var match = versionStr.match(/Linux version (\S+)/);
++				if (match && match[1]) {
++					kernelVersion = match[1];
++				}
++			}
++			var basePath = kernelVersion ? '/lib/modules/' + kernelVersion + '/' : '/lib/modules/';
++
++			// 定义要检测的模块路径
++			var modules = {
++				natflow: basePath + 'natflow.ko',
++				sfe: basePath + 'shortcut-fe.ko',
++				sfeCm: basePath + 'shortcut-fe-cm.ko',
++				fastClass: basePath + 'fast-classifier.ko'
++			};
++
++			return Promise.all([
++				this.callConntrackHelpers(),
++				firewall.getDefaults(),
++				checkModule(modules.natflow),
++				checkModule(modules.sfe),
++				checkModule(modules.sfeCm),
++				checkModule(modules.fastClass)
++			]).then(function([ctHelpers, fwDefaults, natflowOk, sfeOk, sfeCmOk, fastClassOk]) {
++				this._natflowInstalled = natflowOk;
++				this._sfeInstalled = sfeOk;
++				this._sfeCmInstalled = sfeCmOk;
++				this._fastClassInstalled = fastClassOk;
++				return [ctHelpers, fwDefaults];
++			}.bind(this));
++		}.bind(this));
+ 	},
+ 
+ 	render(data) {
+@@ -32,6 +69,10 @@
+ 	renderZones([ctHelpers, fwDefaults]) {
+ 		let m, s, o, out;
+ 		const fw4 = L.hasSystemFeature('firewall4');
++		const natflowInstalled = this._natflowInstalled;
++		const sfeInstalled = this._sfeInstalled;
++		const sfeCmInstalled = this._sfeCmInstalled;
++		const fastClassInstalled = this._fastClassInstalled;
+ 
+ 		m = new form.Map('firewall', _('Firewall - Zone Settings'),
+ 			_('The firewall creates zones over your network interfaces to control network traffic flow.'));
+@@ -68,8 +109,14 @@
+ 			popt.value('ACCEPT', _('accept'));
+ 		}
+ 
+-		/* Netfilter flow offload support */
++		/* FullCone-NAT support */
++		o = s.option(form.ListValue, 'fullcone', _('Enable FullCone-NAT'));
++		o.value('0', _('Disable'));
++		o.value('2', _('High Performing Mode'));
++		o.default = '0';
++		o.rmempty = false;
+ 
++		/* Netfilter flow offload support */
+ 		if (L.hasSystemFeature('offloading')) {
+ 			s = m.section(form.TypedSection, 'defaults', _('Routing/NAT Offloading'),
+ 				_('Not fully compatible with QoS/SQM.'));
+@@ -81,20 +128,89 @@
+ 			o.value('0', _("None"));
+ 			o.value('1', _("Software flow offloading"), _('Software based offloading for routing/NAT.'));
+ 			o.value('2', _("Hardware flow offloading"), _('Hardware based offloading for routing with/without NAT.') + ' ' + _(' Requires hardware NAT support.'));
++
++			if (sfeInstalled) {
++				o.value('3', _("Shortcut-FE flow offloading"), _('Shortcut-FE based offloading for routing/NAT'));
++			}
++			if (natflowInstalled) {
++				o.value('4', _("Natflow offloading"), _('Natflow based offloading for routing/NAT'));
++			}
++
+ 			o.optional = false;
+ 			o.load = function (section_id) {
+ 				const flow_offloading = uci.get('firewall', section_id, 'flow_offloading');
+ 				const flow_offloading_hw = uci.get('firewall', section_id, 'flow_offloading_hw');
+-				return (flow_offloading === '1')
+-					? (flow_offloading_hw === '1' ? '2' : '1')
+-					: '0';
++				const shortcut_fe = uci.get('firewall', section_id, 'shortcut_fe');
++				const natflow = uci.get('firewall', section_id, 'natflow');
++
++				if (flow_offloading === '1') {
++					return flow_offloading_hw === '1' ? '2' : '1';
++				} else if (shortcut_fe === '1') {
++					return '3';
++				} else if (natflow === '1') {
++					return '4';
++				} else {
++					return '0';
++				}
+ 			};
+ 			o.write = function(section_id, value) {
++				// Clear all possible offloading flags first
++				uci.unset('firewall', section_id, 'shortcut_fe');
++				uci.unset('firewall', section_id, 'natflow');
+ 				uci.set('firewall', section_id, 'flow_offloading', value === '0' ? null : '1');
+ 				uci.set('firewall', section_id, 'flow_offloading_hw', value === '2' ? '1' : null);
++
++				if (value === '3') {
++					uci.unset('firewall', section_id, 'flow_offloading');
++					uci.unset('firewall', section_id, 'flow_offloading_hw');
++					uci.unset('firewall', section_id, 'natflow');
++					uci.set('firewall', section_id, 'shortcut_fe', '1');
++				} else if (value === '4') {
++					uci.unset('firewall', section_id, 'flow_offloading');
++					uci.unset('firewall', section_id, 'flow_offloading_hw');
++					uci.unset('firewall', section_id, 'shortcut_fe');
++					uci.set('firewall', section_id, 'natflow', '1');
++				}
+ 			};
+-		}
+ 
++			/* Shortcut-FE flow connection manager — dynamically list only installed modules */
++			if (sfeInstalled) {
++				var cm_option = s.option(form.ListValue, 'shortcut_fe_module',
++					_('Connection Manager'),
++					_('Set up the Shortcut-FE engine connection manager'));
++
++				// 添加已安装的模块选项
++				var cmValues = [];
++				if (sfeCmInstalled) {
++					cm_option.value('shortcut-fe-cm', _('shortcut-fe-cm'));
++					cmValues.push('shortcut-fe-cm');
++				}
++				if (fastClassInstalled) {
++					cm_option.value('fast-classifier', _('fast-classifier'));
++					cmValues.push('fast-classifier');
++				}
++
++				// 如果没有检测到任何连接管理器，默认添加 shortcut-fe-cm（以防模块未检测到但实际可用）
++				if (cmValues.length === 0) {
++					cm_option.value('shortcut-fe-cm', _('shortcut-fe-cm'));
++					cmValues.push('shortcut-fe-cm');
++				}
++
++				// 设置默认值为第一个存在的
++				cm_option.default = cmValues[0];
++				cm_option.depends('offloading_type', '3');
++			}
++
++			/* Natflow delay packet */
++			if (natflowInstalled) {
++				var delay_option = s.option(form.Value, 'natflow_delay_pkts',
++					_('Natflow delay packet'),
++					_('Set up the natflow delay packet'));
++				delay_option.datatype = 'and(uinteger,min(0))';
++				delay_option.default = 0;  // 建议设置为0，与官方推荐一致
++				delay_option.depends('offloading_type', '4');
++			}
++		}
+ 
+ 		s = m.section(form.GridSection, 'zone', _('Zones'));
+ 		s.addremove = true;
